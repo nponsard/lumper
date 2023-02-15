@@ -24,6 +24,7 @@ use vmm_sys_util::terminal::Terminal;
 mod cpu;
 use cpu::{cpuid, mptable, Vcpu};
 mod devices;
+use devices::net::virtio_net::VirtioNet;
 use devices::serial::LumperSerial;
 
 mod epoll_context;
