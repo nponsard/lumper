@@ -155,6 +155,28 @@ impl VMM {
             .insert_str(kernel::DEFAULT_CMDLINE)
             .map_err(Error::Cmdline)
     }
+    // configure the virtio-net device
+    pub fn configure_net(&mut self) -> Result<()> {
+        let mut net = VirtioNet::new();
+
+        // Register the virtio-net device with KVM.
+        // self.vm_fd
+        //     .register_irqfd(&net.irqfd(), net_cfg.irq)
+        //     .map_err(Error::KvmIoctl)?;
+
+        // Register the virtio-net device with the epoll context.
+        // self.epoll
+        //     .add_device(net.irqfd(), EpollDispatch::Net)
+        //     .map_err(Error::EpollError)?;
+
+        // Register the virtio-net device with the VMM.
+        // self.vcpus[0].register_device(net);
+
+        // add the mmio device to the cmdline
+        // self.cmdline.add_virtio_mmio_device(size, baseaddr, irq, id)
+
+        Ok(())
+    }
 
     pub fn configure_io(&mut self) -> Result<()> {
         // First, create the irqchip.
@@ -289,6 +311,8 @@ impl VMM {
         self.configure_memory(mem_size_mb)?;
 
         self.load_default_cmdline()?;
+
+        self.configure_net()?;
 
         let kernel_load = kernel::kernel_setup(
             &self.guest_memory,

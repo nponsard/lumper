@@ -147,11 +147,12 @@ pub fn kernel_setup(
         .map_err(Error::Cmdline)?;
 
     // Load the kernel command line into guest memory.
+
     load_cmdline(
         guest_memory,
         GuestAddress(CMDLINE_START),
         // Safe because the command line is valid.
-        cmdline,
+        &shrinked_cmdline,
     )
     .map_err(Error::KernelLoad)?;
 
