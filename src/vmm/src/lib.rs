@@ -19,11 +19,7 @@ use std::{io, path::PathBuf};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
-use vm_memory::mmap::MmapRegionBuilder;
-use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
-    MemoryRegionAddress,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::terminal::Terminal;
 mod cpu;
 use cpu::{cpuid, mptable, Vcpu};
@@ -75,6 +71,8 @@ pub enum Error {
     ConsoleError(io::Error),
     /// IntoString error
     IntoStringError(std::ffi::IntoStringError),
+    /// Error writing to the guest memory.
+    GuestMemory(vm_memory::guest_memory::Error),
 }
 
 /// Dedicated [`Result`](https://doc.rust-lang.org/std/result/) type.
@@ -164,23 +162,14 @@ impl VMM {
     // configure the virtio-net device
     pub fn configure_net(&mut self) -> Result<()> {
         // Get the raw memory of virtio_net config space and write it to guest memory.
+
+        let guest_addr = GuestAddress(0x0016_0000);
         let virtio_net_config_space = &self.virtio_net.virtio_config.virtio_config.config_space;
-        let virtio_region = GuestRegionMmap::new(
-            MmapRegionBuilder::new(virtio_net_config_space.len())
-                .build()
-                .unwrap(),
-            GuestAddress(0x0016_0000),
-        )
-        .unwrap();
-
-        virtio_region
-            .write_slice(&virtio_net_config_space, MemoryRegionAddress(0))
-            .unwrap();
-
         self.guest_memory
-            .insert_region(Arc::new(virtio_region))
-            .unwrap();
+            .write_slice(&virtio_net_config_space, guest_addr)
+            .map_err(Error::GuestMemory)?;
 
+        // Add the virtio-net device to the cmdline.
         self.cmdline
             .add_virtio_mmio_device(
                 virtio_net_config_space.len() as u64,
