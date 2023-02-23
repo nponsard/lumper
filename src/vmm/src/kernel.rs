@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::result;
 
 use linux_loader::bootparam::boot_params;
-use linux_loader::cmdline::Cmdline;
 use linux_loader::configurator::{linux::LinuxBootConfigurator, BootConfigurator, BootParams};
+use linux_loader::loader::Cmdline;
 use linux_loader::loader::{elf::Elf, load_cmdline, KernelLoader, KernelLoaderResult};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{GuestMemoryMmap, GuestAddress, GuestMemory, Address};
 
 use crate::{Error, Result};
 

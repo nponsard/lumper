@@ -19,7 +19,11 @@ use std::{io, path::PathBuf};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::mmap::MmapRegionBuilder;
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+    MemoryRegionAddress,
+};
 use vmm_sys_util::terminal::Terminal;
 mod cpu;
 use cpu::{cpuid, mptable, Vcpu};
@@ -81,6 +85,7 @@ pub struct VMM {
     kvm: Kvm,
     guest_memory: GuestMemoryMmap,
     vcpus: Vec<Vcpu>,
+    virtio_net: VirtioNet,
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
@@ -110,6 +115,7 @@ impl VMM {
                 LumperSerial::new(Box::new(stdout())).map_err(Error::SerialCreation)?,
             )),
             epoll,
+            virtio_net: VirtioNet::new(),
             cmdline: linux_loader::cmdline::Cmdline::new(CMDLINE_MAX_SIZE)
                 .map_err(Error::Cmdline)?,
         };
@@ -157,7 +163,32 @@ impl VMM {
     }
     // configure the virtio-net device
     pub fn configure_net(&mut self) -> Result<()> {
-        let mut net = VirtioNet::new();
+        // Get the raw memory of virtio_net config space and write it to guest memory.
+        let virtio_net_config_space = &self.virtio_net.virtio_config.virtio_config.config_space;
+        let virtio_region = GuestRegionMmap::new(
+            MmapRegionBuilder::new(virtio_net_config_space.len())
+                .build()
+                .unwrap(),
+            GuestAddress(0x0016_0000),
+        )
+        .unwrap();
+
+        virtio_region
+            .write_slice(&virtio_net_config_space, MemoryRegionAddress(0))
+            .unwrap();
+
+        self.guest_memory
+            .insert_region(Arc::new(virtio_region))
+            .unwrap();
+
+        self.cmdline
+            .add_virtio_mmio_device(
+                virtio_net_config_space.len() as u64,
+                GuestAddress(0x0016_0000),
+                5,
+                None,
+            )
+            .unwrap();
 
         // Register the virtio-net device with KVM.
         // self.vm_fd

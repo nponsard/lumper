@@ -97,6 +97,7 @@ impl VirtioDeviceActions for VirtioNet {
     type E = VirtioNetError;
 
     fn activate(&mut self) -> Result<(), Self::E> {
+        panic!("virtio net activate");
         println!("virtio net activate");
         Ok(())
     }
