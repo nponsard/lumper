@@ -163,20 +163,9 @@ impl VMM {
     pub fn configure_net(&mut self) -> Result<()> {
         // Get the raw memory of virtio_net config space and write it to guest memory.
 
-        let guest_addr = GuestAddress(0x0016_0000);
-        let virtio_net_config_space = &self.virtio_net.virtio_config.virtio_config.config_space;
-        self.guest_memory
-            .write_slice(&virtio_net_config_space, guest_addr)
-            .map_err(Error::GuestMemory)?;
-
         // Add the virtio-net device to the cmdline.
         self.cmdline
-            .add_virtio_mmio_device(
-                virtio_net_config_space.len() as u64,
-                GuestAddress(0x0016_0000),
-                5,
-                None,
-            )
+            .add_virtio_mmio_device(1000u64, GuestAddress(0xD00000000), 5, None)
             .unwrap();
 
         // Register the virtio-net device with KVM.

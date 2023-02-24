@@ -221,6 +221,14 @@ impl Vcpu {
         // VM-Exit. In the latter case, we can inspect the exit reason.
         match self.vcpu_fd.run() {
             Ok(exit_reason) => match exit_reason {
+                VcpuExit::MmioRead(addr, data) => {
+                    println!("MMIO read at 0x{:x}", addr);
+                }
+
+                VcpuExit::MmioWrite(addr, data) => {
+                    println!("MMIO write at 0x{:x}", addr);
+                }
+
                 // The VM stopped (Shutdown ot HLT).
                 VcpuExit::Shutdown | VcpuExit::Hlt => {
                     println!("Guest shutdown: {:?}. Bye!", exit_reason);
