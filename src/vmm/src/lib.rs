@@ -19,7 +19,10 @@ use std::{io, path::PathBuf};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_device::device_manager::IoManager;
+use vm_device::resources::Resource;
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
 mod cpu;
 use cpu::{cpuid, mptable, Vcpu};
@@ -83,7 +86,8 @@ pub struct VMM {
     kvm: Kvm,
     guest_memory: GuestMemoryMmap,
     vcpus: Vec<Vcpu>,
-    virtio_net: VirtioNet,
+
+    io_manager: Arc<Mutex<IoManager>>,
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
@@ -112,8 +116,8 @@ impl VMM {
             serial: Arc::new(Mutex::new(
                 LumperSerial::new(Box::new(stdout())).map_err(Error::SerialCreation)?,
             )),
+            io_manager: Arc::new(Mutex::new(IoManager::new())),
             epoll,
-            virtio_net: VirtioNet::new(),
             cmdline: linux_loader::cmdline::Cmdline::new(CMDLINE_MAX_SIZE)
                 .map_err(Error::Cmdline)?,
         };
@@ -163,26 +167,47 @@ impl VMM {
     pub fn configure_net(&mut self) -> Result<()> {
         // Get the raw memory of virtio_net config space and write it to guest memory.
 
+        // let virtio_address = self
+        //     .virtio_address
+        //     .ok_or(Error::Memory(vm_memory::Error::NoMemoryRegion))?;
+
+        let virtio_address = GuestAddress(0xd0000000);
+
+        // self.guest_memory = GuestMemoryMmap::from_ranges(&[(virtio_address, 0x1000)]).unwrap();
+
+        let irq_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::IrqRegister)?;
+
+        let virtio_net = VirtioNet::new(Arc::new(self.guest_memory.clone()), irq_fd);
+
+        let mut io_manager = self.io_manager.lock().unwrap();
+
+        io_manager
+            .register_mmio_resources(
+                Arc::new(Mutex::new(virtio_net)),
+                &[Resource::GuestAddressRange {
+                    base: virtio_address.raw_value(),
+                    size: 0x1000,
+                }],
+            )
+            .unwrap();
+
         // Add the virtio-net device to the cmdline.
         self.cmdline
-            .add_virtio_mmio_device(1000u64, GuestAddress(0xD00000000), 5, None)
+            .add_virtio_mmio_device(0x1000, virtio_address, 5, None)
             .unwrap();
 
         // Register the virtio-net device with KVM.
         // self.vm_fd
-        //     .register_irqfd(&net.irqfd(), net_cfg.irq)
+        //     .register_irqfd(&(self.virtio_net.as_ref().unwrap().irq_fd), 5)
         //     .map_err(Error::KvmIoctl)?;
 
         // Register the virtio-net device with the epoll context.
         // self.epoll
-        //     .add_device(net.irqfd(), EpollDispatch::Net)
+        //     .add_stdin(net.irqfd(), EpollDispatch::Net)
         //     .map_err(Error::EpollError)?;
 
         // Register the virtio-net device with the VMM.
         // self.vcpus[0].register_device(net);
-
-        // add the mmio device to the cmdline
-        // self.cmdline.add_virtio_mmio_device(size, baseaddr, irq, id)
 
         Ok(())
     }
@@ -236,8 +261,13 @@ impl VMM {
             .map_err(Error::KvmIoctl)?;
 
         for index in 0..num_vcpus {
-            let vcpu = Vcpu::new(&self.vm_fd, index.into(), Arc::clone(&self.serial))
-                .map_err(Error::Vcpu)?;
+            let vcpu = Vcpu::new(
+                &self.vm_fd,
+                index.into(),
+                Arc::clone(&self.serial),
+                self.io_manager.clone(),
+            )
+            .map_err(Error::Vcpu)?;
 
             // Set CPUID.
             let mut vcpu_cpuid = base_cpuid.clone();
@@ -287,8 +317,16 @@ impl VMM {
 
         // Let's start the STDIN polling thread.
         loop {
-            let num_events =
-                epoll::wait(epoll_fd, -1, &mut events[..]).map_err(Error::EpollError)?;
+            let num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {
+                Ok(num_events) => num_events,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    } else {
+                        return Err(Error::EpollError(e));
+                    }
+                }
+            };
 
             for event in events.iter().take(num_events) {
                 let event_data = event.data as RawFd;
