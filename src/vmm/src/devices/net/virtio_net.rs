@@ -6,12 +6,10 @@ use std::{
 
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 
-use virtio_bindings::bindings::virtio_net;
+use virtio_bindings::bindings::{virtio_blk::VIRTIO_F_VERSION_1, virtio_net};
 use virtio_device::VirtioDevice;
-use virtio_queue::QueueT;
-use vm_device::{
-    MutVirtioMmioDevice, VirtioMmioDevice as VirtioMmioDeviceVmDevice, VirtioMmioOffset,
-};
+use virtio_queue::{Queue, QueueT};
+use vm_device::{MutVirtioMmioDevice, VirtioMmioOffset};
 use vm_memory::{GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
 #[derive(Debug)]
@@ -32,7 +30,6 @@ pub struct VirtioNet<M: GuestAddressSpace + Clone + Send> {
 }
 
 pub struct VirtioNetConfig {
-    pub guest_page_size: u16,
     pub virtio_config: VirtioConfig<virtio_queue::Queue>,
 }
 
@@ -43,8 +40,13 @@ impl VirtioNetConfig {
                 virtio_net::VIRTIO_NET_F_STATUS as u64
                     | virtio_net::VIRTIO_NET_F_MAC as u64
                     | virtio_net::VIRTIO_NET_F_SPEED_DUPLEX as u64
-                    | virtio_net::VIRTIO_NET_F_MTU as u64,
-                vec![],
+                    | virtio_net::VIRTIO_NET_F_MTU as u64
+                    | VIRTIO_F_VERSION_1 as u64,
+                vec![
+                    Queue::new(256).unwrap(),
+                    Queue::new(256).unwrap(),
+                    Queue::new(256).unwrap(),
+                ],
                 VirtioNetConfig::config_vec(virtio_net::virtio_net_config {
                     mac: [13, 13, 13, 13, 13, 13],
                     status: 0,
@@ -54,7 +56,6 @@ impl VirtioNetConfig {
                     duplex: 1,
                 }),
             ),
-            guest_page_size: 0,
         }
     }
 
@@ -103,11 +104,11 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
             }
 
             VirtioMmioOffset::GuestFeatures(_) => {
-                let mut features = u64::from_le_bytes(
+                let mut features = u32::from_le_bytes(
                     data[0..4]
                         .try_into()
                         .map_err(|_| VirtioNetError::RegisterError)?,
-                );
+                ) as u64;
                 if self.device_config.virtio_config.driver_features_select != 0 {
                     features >>= 32;
                 }
@@ -118,15 +119,6 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
             VirtioMmioOffset::GuestFeaturesSel(_) => {
                 self.device_config.virtio_config.driver_features_select = u32::from_le_bytes(
                     data[0..4]
-                        .try_into()
-                        .map_err(|_| VirtioNetError::RegisterError)?,
-                );
-                Ok(())
-            }
-
-            VirtioMmioOffset::GuestPageSize(_) => {
-                self.device_config.guest_page_size = u16::from_le_bytes(
-                    data[0..2]
                         .try_into()
                         .map_err(|_| VirtioNetError::RegisterError)?,
                 );
@@ -153,23 +145,15 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
                 Ok(())
             }
 
-            VirtioMmioOffset::QueueAlign(_) => {
-                println!("Ignoring queue alignment");
-                Ok(())
-            }
-
-            // Since its a 64 bit register, there is probably 2 writes to this ?
-            VirtioMmioOffset::QueuePfn(_) => {
-                let queue_pfn = u32::from_le_bytes(
-                    data[0..4]
-                        .try_into()
-                        .map_err(|_| VirtioNetError::RegisterError)?,
-                );
+            VirtioMmioOffset::QueueReady(_) => {
                 self.device_config.virtio_config.queues
                     [self.device_config.virtio_config.queue_select as usize]
-                    .set_desc_table_address(
-                        Some(queue_pfn * self.device_config.guest_page_size as u32),
-                        None,
+                    .set_ready(
+                        u32::from_le_bytes(
+                            data[0..4]
+                                .try_into()
+                                .map_err(|_| VirtioNetError::RegisterError)?,
+                        ) != 0,
                     );
                 Ok(())
             }
@@ -199,8 +183,37 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
                     data[0..4]
                         .try_into()
                         .map_err(|_| VirtioNetError::RegisterError)?,
-                );
+                ) as u8;
+                self.device_config.virtio_config.device_status = status;
                 println!("Status: {}", status);
+                Ok(())
+            }
+
+            VirtioMmioOffset::QueueDescLow(_) => {
+                self.device_config.virtio_config.queues
+                    [self.device_config.virtio_config.queue_select as usize]
+                    .set_desc_table_address(
+                        Some(u32::from_le_bytes(
+                            data[0..4]
+                                .try_into()
+                                .map_err(|_| VirtioNetError::RegisterError)?,
+                        )),
+                        None,
+                    );
+                Ok(())
+            }
+
+            VirtioMmioOffset::QueueDescHigh(_) => {
+                self.device_config.virtio_config.queues
+                    [self.device_config.virtio_config.queue_select as usize]
+                    .set_desc_table_address(
+                        None,
+                        Some(u32::from_le_bytes(
+                            data[0..4]
+                                .try_into()
+                                .map_err(|_| VirtioNetError::RegisterError)?,
+                        )),
+                    );
                 Ok(())
             }
 
@@ -236,7 +249,7 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
             }
             VirtioMmioOffset::HostFeatures(_) => {
                 let mut device_features = self.device_config.virtio_config.device_features;
-                if self.device_config.virtio_config.device_features_select != 0 {
+                if self.device_config.virtio_config.device_features_select == 0 {
                     device_features >>= 32;
                 }
                 data.copy_from_slice(&(device_features as u32).to_le_bytes());
@@ -247,9 +260,11 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
                 data.copy_from_slice(&queue_num_max.to_le_bytes());
                 Ok(())
             }
-            VirtioMmioOffset::QueuePfn(_) => {
-                let queue_pfn = 0x12341234 as u32;
-                data.copy_from_slice(&queue_pfn.to_le_bytes());
+            VirtioMmioOffset::QueueReady(_) => {
+                let queue_ready = self.device_config.virtio_config.queues
+                    [self.device_config.virtio_config.queue_select as usize]
+                    .ready() as u32;
+                data.copy_from_slice(&queue_ready.to_le_bytes());
                 Ok(())
             }
             VirtioMmioOffset::InterruptStatus(_) => {
@@ -336,16 +351,9 @@ impl<M: GuestAddressSpace + Clone + Send> MutVirtioMmioDevice for VirtioNet<M> {
             let registerer_field = VirtioMmioOffset::from(offset);
 
             if let Err(e) = self.register_write(registerer_field, data) {
-                println!("virtio net mmio read error: {:?}", e);
+                println!("virtio net mmio write error: {:?}", e);
             }
         }
-        println!(
-            "sent {}",
-            Vec::from(data)
-                .iter()
-                .map(|x| format!("{:02x}", x))
-                .collect::<String>()
-        );
         return;
     }
 }
