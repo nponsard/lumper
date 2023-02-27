@@ -165,15 +165,7 @@ impl VMM {
     }
     // configure the virtio-net device
     pub fn configure_net(&mut self) -> Result<()> {
-        // Get the raw memory of virtio_net config space and write it to guest memory.
-
-        // let virtio_address = self
-        //     .virtio_address
-        //     .ok_or(Error::Memory(vm_memory::Error::NoMemoryRegion))?;
-
         let virtio_address = GuestAddress(0xd0000000);
-
-        // self.guest_memory = GuestMemoryMmap::from_ranges(&[(virtio_address, 0x1000)]).unwrap();
 
         let irq_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::IrqRegister)?;
 
