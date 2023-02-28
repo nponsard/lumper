@@ -8,12 +8,19 @@ use virtio_device::{
     VirtioConfig, VirtioDevice, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice,
 };
 
-use virtio_bindings::bindings::{virtio_blk::VIRTIO_F_VERSION_1, virtio_net};
+use virtio_bindings::bindings::{
+    virtio_blk::VIRTIO_F_VERSION_1,
+    virtio_net::{self, virtio_net_hdr_v1},
+};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_device::{MutVirtioMmioDevice, VirtioMmioOffset};
-use vm_memory::{GuestAddress, GuestAddressSpace};
+use vm_memory::{Address, Bytes, GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
+
+const VIRTIO_HDR_LEN: usize = ::core::mem::size_of::<virtio_net_hdr_v1>();
+
 #[derive(Debug)]
+
 pub enum VirtioNetError {}
 impl Error for VirtioNetError {}
 impl Display for VirtioNetError {
@@ -80,9 +87,38 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioMmioDevice for VirtioNet<M> {
         let mem = self.address_space.memory().clone();
         let queue = self.queue_mut(val as u16).unwrap();
 
-        queue.iter(mem).unwrap().for_each(|desc| {
+        queue.iter(mem.clone()).unwrap().for_each(|desc| {
             desc.for_each(|desc| {
-                println!("Desc: {:?}", desc);
+                if (desc.len() as usize) < VIRTIO_HDR_LEN {
+                    println!("invalid virtio header length");
+                    return;
+                }
+
+                let mut header_buffer: [u8; VIRTIO_HDR_LEN] = [0u8; VIRTIO_HDR_LEN];
+                let mut data_buffer: Vec<u8> = Vec::new();
+
+                // Safe since we checked the length of the data
+                mem.read_slice(&mut header_buffer, desc.addr()).unwrap();
+                let header = virtio_net_hdr_v1 {
+                    flags: header_buffer[0],
+                    gso_type: header_buffer[1],
+                    hdr_len: u16::from_le_bytes([header_buffer[2], header_buffer[3]]),
+                    gso_size: u16::from_le_bytes([header_buffer[4], header_buffer[5]]),
+                    csum_start: u16::from_le_bytes([header_buffer[6], header_buffer[7]]),
+                    csum_offset: u16::from_le_bytes([header_buffer[8], header_buffer[9]]),
+                    num_buffers: u16::from_le_bytes([header_buffer[10], header_buffer[11]]),
+                };
+                data_buffer.resize(desc.len() as usize - VIRTIO_HDR_LEN, 0u8);
+                mem.read_slice(
+                    &mut data_buffer,
+                    desc.addr().overflowing_add(VIRTIO_HDR_LEN as u64).0,
+                )
+                .unwrap();
+
+                println!("header: {:?}", header);
+                println!("data: ");
+
+                data_buffer.iter().for_each(|b| print!("{:#x?}", *b));
             })
         });
     }
