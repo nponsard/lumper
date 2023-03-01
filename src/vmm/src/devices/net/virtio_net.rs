@@ -85,42 +85,52 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioMmioDevice for VirtioNet<M> {
     fn queue_notify(&mut self, val: u32) {
         println!("queue notify");
         let mem = self.address_space.memory().clone();
-        let queue = self.queue_mut(val as u16).unwrap();
+        let irq = &mut self.irq_fd;
+        let queue = &mut self.device_config.queues[val as usize];
 
-        queue.iter(mem.clone()).unwrap().for_each(|desc| {
-            desc.for_each(|desc| {
-                if (desc.len() as usize) < VIRTIO_HDR_LEN {
-                    println!("invalid virtio header length");
-                    return;
-                }
+        loop {
+            queue.disable_notification(&*mem).unwrap();
 
-                let mut header_buffer: [u8; VIRTIO_HDR_LEN] = [0u8; VIRTIO_HDR_LEN];
-                let mut data_buffer: Vec<u8> = Vec::new();
+            // Consume entries from the available ring.
+            while let Some(chain) = queue.iter(&*mem).unwrap().next() {
+                queue.add_used(&*mem, chain.head_index(), 0x100).unwrap();
+                println!("chain");
+                chain.for_each(|desc| {
+                    if (desc.len() as usize) < VIRTIO_HDR_LEN {
+                        println!("invalid virtio header length");
+                        return;
+                    }
 
-                // Safe since we checked the length of the data
-                mem.read_slice(&mut header_buffer, desc.addr()).unwrap();
-                let header = virtio_net_hdr_v1 {
-                    flags: header_buffer[0],
-                    gso_type: header_buffer[1],
-                    hdr_len: u16::from_le_bytes([header_buffer[2], header_buffer[3]]),
-                    gso_size: u16::from_le_bytes([header_buffer[4], header_buffer[5]]),
-                    csum_start: u16::from_le_bytes([header_buffer[6], header_buffer[7]]),
-                    csum_offset: u16::from_le_bytes([header_buffer[8], header_buffer[9]]),
-                    num_buffers: u16::from_le_bytes([header_buffer[10], header_buffer[11]]),
-                };
-                data_buffer.resize(desc.len() as usize - VIRTIO_HDR_LEN, 0u8);
-                mem.read_slice(
-                    &mut data_buffer,
-                    desc.addr().overflowing_add(VIRTIO_HDR_LEN as u64).0,
-                )
-                .unwrap();
+                    let mut header_buffer: [u8; VIRTIO_HDR_LEN] = [0u8; VIRTIO_HDR_LEN];
+                    let mut data_buffer: Vec<u8> = Vec::new();
 
-                println!("header: {:?}", header);
-                println!("data: ");
+                    // Safe since we checked the length of the data
+                    mem.read_slice(&mut header_buffer, desc.addr()).unwrap();
+                    let header = virtio_net_hdr_v1 {
+                        flags: header_buffer[0],
+                        gso_type: header_buffer[1],
+                        hdr_len: u16::from_le_bytes([header_buffer[2], header_buffer[3]]),
+                        gso_size: u16::from_le_bytes([header_buffer[4], header_buffer[5]]),
+                        csum_start: u16::from_le_bytes([header_buffer[6], header_buffer[7]]),
+                        csum_offset: u16::from_le_bytes([header_buffer[8], header_buffer[9]]),
+                        num_buffers: u16::from_le_bytes([header_buffer[10], header_buffer[11]]),
+                    };
+                    data_buffer.resize(desc.len() as usize - VIRTIO_HDR_LEN, 0u8);
+                    mem.read_slice(
+                        &mut data_buffer,
+                        desc.addr().overflowing_add(VIRTIO_HDR_LEN as u64).0,
+                    )
+                    .unwrap();
+                });
+            }
+            if queue.needs_notification(&*mem).unwrap() {
+                irq.write(1).unwrap();
+            }
 
-                data_buffer.iter().for_each(|b| print!("{:#x?}", *b));
-            })
-        });
+            if !queue.enable_notification(&*mem).unwrap() {
+                break;
+            }
+        }
     }
 }
 

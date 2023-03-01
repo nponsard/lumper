@@ -19,6 +19,7 @@ use std::{io, path::PathBuf};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
+use vm_device::bus::BusManager;
 use vm_device::device_manager::IoManager;
 use vm_device::resources::Resource;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
@@ -88,6 +89,7 @@ pub struct VMM {
     vcpus: Vec<Vcpu>,
 
     io_manager: Arc<Mutex<IoManager>>,
+    net_irqfd: Option<EventFd>,
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
@@ -116,6 +118,7 @@ impl VMM {
             serial: Arc::new(Mutex::new(
                 LumperSerial::new(Box::new(stdout())).map_err(Error::SerialCreation)?,
             )),
+            net_irqfd: None,
             io_manager: Arc::new(Mutex::new(IoManager::new())),
             epoll,
             cmdline: linux_loader::cmdline::Cmdline::new(CMDLINE_MAX_SIZE)
@@ -169,6 +172,8 @@ impl VMM {
 
         let irq_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::IrqRegister)?;
 
+        self.net_irqfd = Some(irq_fd.try_clone().map_err(Error::IrqRegister)?);
+
         let virtio_net = VirtioNet::new(Arc::new(self.guest_memory.clone()), irq_fd);
 
         let mut io_manager = self.io_manager.lock().unwrap();
@@ -176,10 +181,13 @@ impl VMM {
         io_manager
             .register_mmio_resources(
                 Arc::new(Mutex::new(virtio_net)),
-                &[Resource::GuestAddressRange {
-                    base: virtio_address.raw_value(),
-                    size: 0x1000,
-                }],
+                &[
+                    Resource::GuestAddressRange {
+                        base: virtio_address.raw_value(),
+                        size: 0x1000,
+                    },
+                    Resource::LegacyIrq(5),
+                ],
             )
             .unwrap();
 
@@ -222,6 +230,10 @@ impl VMM {
                     .map_err(Error::IrqRegister)?,
                 4,
             )
+            .map_err(Error::KvmIoctl)?;
+
+        self.vm_fd
+            .register_irqfd(self.net_irqfd.as_ref().unwrap(), 5)
             .map_err(Error::KvmIoctl)?;
 
         Ok(())
