@@ -278,7 +278,7 @@ impl Vcpu {
                 // This is a MMIO write, i.e. the guest is trying to write
                 // something to a memory-mapped I/O region.
                 VcpuExit::MmioWrite(addr, data) => {
-                    println!("MMIO write at {:x?} with data {:x?}", addr, data);
+                    // println!("MMIO write at {:x?} with data {:x?}", addr, data);
                     self.io_manager
                         .lock()
                         .unwrap()
@@ -289,7 +289,7 @@ impl Vcpu {
                 // This is a MMIO read, i.e. the guest is trying to read
                 // from a memory-mapped I/O region.
                 VcpuExit::MmioRead(addr, data) => {
-                    println!("MMIO read at {:x?} with data {:x?}", addr, data);
+                    // println!("MMIO read at {:x?} with data {:x?}", addr, data);
                     self.io_manager
                         .lock()
                         .unwrap()

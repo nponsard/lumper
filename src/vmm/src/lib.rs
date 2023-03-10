@@ -196,11 +196,6 @@ impl VMM {
             .add_virtio_mmio_device(0x1000, virtio_address, 5, None)
             .unwrap();
 
-        // Register the virtio-net device with KVM.
-        // self.vm_fd
-        //     .register_irqfd(&(self.virtio_net.as_ref().unwrap().irq_fd), 5)
-        //     .map_err(Error::KvmIoctl)?;
-
         // Register the virtio-net device with the epoll context.
         // self.epoll
         //     .add_stdin(net.irqfd(), EpollDispatch::Net)
