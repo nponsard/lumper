@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{io, path::PathBuf};
 
+use devices::net::tap::Tap;
+use devices::net::VirtioNet;
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
-use vm_device::bus::BusManager;
 use vm_device::device_manager::IoManager;
 use vm_device::resources::Resource;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
@@ -28,7 +29,6 @@ use vmm_sys_util::terminal::Terminal;
 mod cpu;
 use cpu::{cpuid, mptable, Vcpu};
 mod devices;
-use devices::net::virtio_net::VirtioNet;
 use devices::serial::LumperSerial;
 
 mod epoll_context;
@@ -77,6 +77,10 @@ pub enum Error {
     IntoStringError(std::ffi::IntoStringError),
     /// Error writing to the guest memory.
     GuestMemory(vm_memory::guest_memory::Error),
+    /// Error related to the virtio-net device.
+    VirtioNet(devices::net::VirtioNetError),
+    /// Error related to IOManager.
+    IoManager(vm_device::device_manager::Error),
 }
 
 /// Dedicated [`Result`](https://doc.rust-lang.org/std/result/) type.
@@ -89,7 +93,7 @@ pub struct VMM {
     vcpus: Vec<Vcpu>,
 
     io_manager: Arc<Mutex<IoManager>>,
-    virtio_net: Option<Arc<Mutex<VirtioNet<Arc<GuestMemoryMmap>>>>>,
+    virtio_net: Option<Arc<Mutex<VirtioNet<Arc<GuestMemoryMmap>, Tap>>>>,
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
@@ -167,15 +171,25 @@ impl VMM {
             .map_err(Error::Cmdline)
     }
     // configure the virtio-net device
-    pub fn configure_net(&mut self) -> Result<()> {
+    pub fn configure_net(&mut self, interface: Option<String>) -> Result<()> {
+        let if_name = match interface {
+            Some(if_name) => if_name,
+            None => return Ok(()),
+        };
+
         let virtio_address = GuestAddress(0xd0000000);
 
         let irq_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::IrqRegister)?;
 
-        let virtio_net = VirtioNet::new(Arc::new(self.guest_memory.clone()), irq_fd);
+        let virtio_net = VirtioNet::new(
+            Arc::new(self.guest_memory.clone()),
+            irq_fd,
+            if_name.as_str(),
+        )
+        .map_err(Error::VirtioNet)?;
 
         self.epoll
-            .add_tap(virtio_net.tap_raw_fd())
+            .add_tap(virtio_net.as_raw_fd())
             .map_err(Error::EpollError)?;
         let mut io_manager = self.io_manager.lock().unwrap();
 
@@ -183,6 +197,7 @@ impl VMM {
 
         io_manager
             .register_mmio_resources(
+                // It's safe to unwrap because the virtio-net was just assigned
                 self.virtio_net.as_ref().unwrap().clone(),
                 &[
                     Resource::GuestAddressRange {
@@ -192,17 +207,12 @@ impl VMM {
                     Resource::LegacyIrq(5),
                 ],
             )
-            .unwrap();
+            .map_err(Error::IoManager)?;
 
         // Add the virtio-net device to the cmdline.
         self.cmdline
             .add_virtio_mmio_device(0x1000, virtio_address, 5, None)
-            .unwrap();
-
-        // Register the virtio-net device with the epoll context.
-
-        // Register the virtio-net device with the VMM.
-        // self.vcpus[0].register_device(net);
+            .map_err(Error::Cmdline)?;
 
         Ok(())
     }
@@ -227,10 +237,11 @@ impl VMM {
             )
             .map_err(Error::KvmIoctl)?;
 
-        self.vm_fd
-            .register_irqfd(&self.virtio_net.clone().unwrap().lock().unwrap().irq_fd, 5)
-            .map_err(Error::KvmIoctl)?;
-
+        if let Some(virtio_net) = self.virtio_net.as_ref() {
+            self.vm_fd
+                .register_irqfd(&virtio_net.lock().unwrap().guest_irq_fd, 5)
+                .map_err(Error::KvmIoctl)?;
+        }
         Ok(())
     }
 
@@ -313,8 +324,11 @@ impl VMM {
             .map_err(Error::TerminalConfigure)?;
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
         let epoll_fd = self.epoll.as_raw_fd();
-
-        // Let's start the STDIN polling thread.
+        let interface_fd = match self.virtio_net.as_ref() {
+            Some(virtio_net) => Some(virtio_net.lock().unwrap().interface.as_raw_fd()),
+            None => None,
+        };
+        // Let's start the STDIN/Network interface polling thread.
         loop {
             let num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {
                 Ok(num_events) => num_events,
@@ -326,15 +340,6 @@ impl VMM {
                     }
                 }
             };
-
-            let tap_fd = self
-                .virtio_net
-                .as_ref()
-                .unwrap()
-                .clone()
-                .lock()
-                .unwrap()
-                .tap_raw_fd();
 
             for event in events.iter().take(num_events) {
                 let event_data = event.data as RawFd;
@@ -352,27 +357,16 @@ impl VMM {
                         .map_err(Error::StdinWrite)?;
                 }
 
-                if tap_fd == event_data {
+                if interface_fd == Some(event_data) {
                     self.virtio_net
                         .as_ref()
+                        // Safe because we checked that the virtio_net is Some before the loop.
                         .unwrap()
                         .lock()
                         .unwrap()
                         .process_tap()
-                        .unwrap();
+                        .map_err(Error::VirtioNet)?;
                 }
-                //if let EPOLL_NETFD = event_data {
-                //let mut out = [0u8; 2048];
-
-                //let count = self.netfd.read(&mut out).map_err(Error::NetRead)?;
-
-                //self.serial
-                //.lock()
-                //.unwrap()
-                //.serial
-                //.enqueue_raw_bytes(&out[..count])
-                //.map_err(Error::NetWrite)?;
-                //}
             }
         }
     }
@@ -383,13 +377,14 @@ impl VMM {
         mem_size_mb: u32,
         kernel_path: &str,
         console: Option<String>,
+        if_name: Option<String>,
     ) -> Result<()> {
         self.configure_console(console)?;
         self.configure_memory(mem_size_mb)?;
 
         self.load_default_cmdline()?;
 
-        self.configure_net()?;
+        self.configure_net(if_name)?;
 
         let kernel_load = kernel::kernel_setup(
             &self.guest_memory,

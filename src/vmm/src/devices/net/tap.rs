@@ -10,13 +10,16 @@
 
 use std::fs::File;
 use std::io::{Error as IoError, Read, Result as IoResult, Write};
-use std::os::raw::{c_char, c_int, c_uint, c_ulong};
+use std::os::raw::{c_char, c_uint, c_ulong};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
+use virtio_bindings::bindings::virtio_net::{VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_UFO};
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
 use vmm_sys_util::{ioctl_ioc_nr, ioctl_iow_nr};
 
-use super::bindings::ifreq;
+use super::bindings::{ifreq, TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_UFO};
+use super::interface::Interface;
+use super::VirtioNetError;
 
 // As defined in the Linux UAPI:
 // https://elixir.bootlin.com/linux/v4.17/source/include/uapi/linux/if.h#L33
@@ -27,21 +30,6 @@ const IFACE_NAME_MAX_LEN: usize = 16;
 const IFF_TAP: ::std::os::raw::c_uint = 2;
 const IFF_NO_PI: ::std::os::raw::c_uint = 4096;
 const IFF_VNET_HDR: ::std::os::raw::c_uint = 16384;
-
-/// List of errors the tap implementation can throw.
-#[derive(Debug)]
-pub enum Error {
-    /// Unable to create tap interface.
-    CreateTap(IoError),
-    /// Invalid interface name.
-    InvalidIfname,
-    /// ioctl failed.
-    IoctlError(IoError),
-    /// Couldn't open /dev/net/tun.
-    OpenTun(IoError),
-}
-
-pub type Result<T> = ::std::result::Result<T, Error>;
 
 const TUNTAP: ::std::os::raw::c_uint = 84;
 ioctl_iow_nr!(TUNSETIFF, TUNTAP, 202, ::std::os::raw::c_int);
@@ -56,18 +44,84 @@ ioctl_iow_nr!(TUNSETVNETHDRSZ, TUNTAP, 216, ::std::os::raw::c_int);
 #[derive(Debug)]
 pub struct Tap {
     tap_file: File,
-    pub(crate) if_name: [u8; IFACE_NAME_MAX_LEN],
+}
+
+impl Tap {
+    fn virtio_flags_to_tuntap_flags(virtio_flags: u64) -> c_uint {
+        // Check if VIRTIO_NET_F_CSUM is set and set TUN_F_CSUM if so. Do the same for UFO, TSO6 and TSO4.
+        let mut flags = 0;
+        if virtio_flags & (1 << VIRTIO_NET_F_CSUM) != 0 {
+            flags |= TUN_F_CSUM;
+        }
+        if virtio_flags & (1 << VIRTIO_NET_F_HOST_UFO) != 0 {
+            flags |= TUN_F_UFO;
+        }
+        if virtio_flags & (1 << VIRTIO_NET_F_HOST_UFO) != 0 {
+            flags |= TUN_F_TSO4;
+        }
+        if virtio_flags & (1 << VIRTIO_NET_F_HOST_UFO) != 0 {
+            flags |= TUN_F_TSO6;
+        }
+
+        flags
+    }
+}
+
+impl Interface for Tap {
+    fn activate(&self, virtio_flags: u64, virtio_header_size: usize) -> super::Result<()> {
+        let flags = Tap::virtio_flags_to_tuntap_flags(virtio_flags);
+
+        let ret = unsafe { ioctl_with_val(self, TUNSETOFFLOAD(), flags as c_ulong) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error()).map_err(VirtioNetError::IoCtlError);
+        }
+
+        // Safe because we know that our file is a valid tap device and we verify the result.
+        let ret = unsafe { ioctl_with_ref(self, TUNSETVNETHDRSZ(), &virtio_header_size) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error()).map_err(VirtioNetError::IoCtlError);
+        }
+
+        Ok(())
+    }
+
+    fn open_named(if_name: &str) -> super::Result<Self> {
+        let terminated_if_name = build_terminated_if_name(if_name)?;
+
+        let fd = unsafe {
+            // Open calls are safe because we give a constant null-terminated
+            // string and verify the result.
+            libc::open(
+                b"/dev/net/tun\0".as_ptr() as *const c_char,
+                libc::O_RDWR | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(IoError::last_os_error()).map_err(VirtioNetError::IoError);
+        }
+        // We just checked that the fd is valid.
+        let tuntap = unsafe { File::from_raw_fd(fd) };
+
+        IfReqBuilder::new()
+            .if_name(&terminated_if_name)
+            .flags((IFF_TAP | IFF_NO_PI | IFF_VNET_HDR) as i16)
+            .execute(&tuntap, TUNSETIFF())
+            .unwrap();
+
+        // Safe since only the name is accessed, and it's cloned out.
+        Ok(Tap { tap_file: tuntap })
+    }
 }
 
 // Returns a byte vector representing the contents of a null terminated C string which
 // contains if_name.
-fn build_terminated_if_name(if_name: &str) -> Result<[u8; IFACE_NAME_MAX_LEN]> {
+fn build_terminated_if_name(if_name: &str) -> super::Result<[u8; IFACE_NAME_MAX_LEN]> {
     // Convert the string slice to bytes, and shadow the variable,
     // since we no longer need the &str version.
     let if_name = if_name.as_bytes();
 
     if if_name.len() >= IFACE_NAME_MAX_LEN {
-        return Err(Error::InvalidIfname);
+        return Err(VirtioNetError::InvalidIfname);
     }
 
     let mut terminated_if_name = [b'\0'; IFACE_NAME_MAX_LEN];
@@ -100,82 +154,14 @@ impl IfReqBuilder {
         self
     }
 
-    pub(crate) fn execute<F: AsRawFd>(mut self, socket: &F, ioctl: u64) -> Result<ifreq> {
+    pub(crate) fn execute<F: AsRawFd>(mut self, socket: &F, ioctl: u64) -> super::Result<ifreq> {
         // ioctl is safe. Called with a valid socket fd, and we check the return.
         let ret = unsafe { ioctl_with_mut_ref(socket, ioctl, &mut self.0) };
         if ret < 0 {
-            return Err(Error::IoctlError(IoError::last_os_error()));
+            return Err(VirtioNetError::IoCtlError(IoError::last_os_error()));
         }
 
         Ok(self.0)
-    }
-}
-
-impl Tap {
-    /// Create a TUN/TAP device given the interface name.
-    /// # Arguments
-    ///
-    /// * `if_name` - the name of the interface.
-    pub fn open_named(if_name: &str) -> Result<Tap> {
-        let terminated_if_name = build_terminated_if_name(if_name)?;
-
-        let fd = unsafe {
-            // Open calls are safe because we give a constant null-terminated
-            // string and verify the result.
-            libc::open(
-                b"/dev/net/tun\0".as_ptr() as *const c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
-            )
-        };
-        if fd < 0 {
-            return Err(Error::OpenTun(IoError::last_os_error()));
-        }
-        // We just checked that the fd is valid.
-        let tuntap = unsafe { File::from_raw_fd(fd) };
-
-        println!("Creating tap with name: {}", if_name);
-
-        let ifreq = IfReqBuilder::new()
-            .if_name(&terminated_if_name)
-            .flags((IFF_TAP | IFF_NO_PI | IFF_VNET_HDR) as i16)
-            .execute(&tuntap, TUNSETIFF())?;
-
-        // Safe since only the name is accessed, and it's cloned out.
-        Ok(Tap {
-            tap_file: tuntap,
-            if_name: unsafe { *ifreq.ifr_ifrn.ifrn_name.as_ref() },
-        })
-    }
-
-    pub fn if_name_as_str(&self) -> &str {
-        let len = self
-            .if_name
-            .iter()
-            .position(|x| *x == 0)
-            .unwrap_or(IFACE_NAME_MAX_LEN);
-        std::str::from_utf8(&self.if_name[..len]).unwrap_or("")
-    }
-
-    /// Set the offload flags for the tap interface.
-    pub fn set_offload(&self, flags: c_uint) -> Result<()> {
-        // ioctl is safe. Called with a valid tap fd, and we check the return.
-        let ret = unsafe { ioctl_with_val(&self.tap_file, TUNSETOFFLOAD(), c_ulong::from(flags)) };
-        if ret < 0 {
-            return Err(Error::IoctlError(IoError::last_os_error()));
-        }
-
-        Ok(())
-    }
-
-    /// Set the size of the vnet hdr.
-    pub fn set_vnet_hdr_size(&self, size: c_int) -> Result<()> {
-        // ioctl is safe. Called with a valid tap fd, and we check the return.
-        let ret = unsafe { ioctl_with_ref(&self.tap_file, TUNSETVNETHDRSZ(), &size) };
-        if ret < 0 {
-            return Err(Error::IoctlError(IoError::last_os_error()));
-        }
-
-        Ok(())
     }
 }
 
@@ -200,6 +186,3 @@ impl AsRawFd for Tap {
         self.tap_file.as_raw_fd()
     }
 }
-
-// TODO: If we don't end up using an external abstraction for `Tap` interfaces, add unit tests
-// based on a mock framework that do not require elevated privileges to run.
