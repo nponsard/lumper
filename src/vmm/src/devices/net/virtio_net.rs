@@ -274,8 +274,6 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioMmioDevice for VirtioNet<M> {
                 break;
             }
         }
-
-        self.process_tap().unwrap();
     }
 }
 
