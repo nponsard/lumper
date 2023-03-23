@@ -18,6 +18,17 @@ impl EpollContext {
         Ok(EpollContext { raw_fd })
     }
 
+    pub fn add_tap(&self, tap_fd: RawFd) -> result::Result<(), io::Error> {
+        epoll::ctl(
+            self.raw_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            tap_fd,
+            epoll::Event::new(epoll::Events::EPOLLIN, tap_fd as u64),
+        )?;
+
+        Ok(())
+    }
+
     pub fn add_stdin(&self) -> result::Result<(), io::Error> {
         epoll::ctl(
             self.raw_fd,

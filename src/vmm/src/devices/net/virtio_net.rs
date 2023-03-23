@@ -4,6 +4,8 @@ use std::{
     error::Error,
     fmt::{self, Debug, Display},
     io::Write,
+    os::fd::{AsRawFd, RawFd},
+    sync::atomic::Ordering,
 };
 
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
@@ -92,6 +94,10 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
         } else {
             true
         }
+    }
+
+    pub fn tap_raw_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
     }
 
     fn write_frame_to_guest(
@@ -195,6 +201,9 @@ impl<M: GuestAddressSpace + Clone + Send> VirtioNet<M> {
                 .needs_notification(&*self.address_space.memory())
                 .unwrap()
             {
+                self.device_config
+                    .interrupt_status
+                    .store(1, Ordering::SeqCst);
                 println!("notifying guest");
                 let irq = &mut self.irq_fd;
                 irq.write(1).unwrap();

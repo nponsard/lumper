@@ -90,6 +90,7 @@ pub struct VMM {
 
     io_manager: Arc<Mutex<IoManager>>,
     net_irqfd: Option<EventFd>,
+    net_tapfd: Option<RawFd>,
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
@@ -119,6 +120,7 @@ impl VMM {
                 LumperSerial::new(Box::new(stdout())).map_err(Error::SerialCreation)?,
             )),
             net_irqfd: None,
+            net_tapfd: None,
             io_manager: Arc::new(Mutex::new(IoManager::new())),
             epoll,
             cmdline: linux_loader::cmdline::Cmdline::new(CMDLINE_MAX_SIZE)
@@ -175,7 +177,11 @@ impl VMM {
         self.net_irqfd = Some(irq_fd.try_clone().map_err(Error::IrqRegister)?);
 
         let virtio_net = VirtioNet::new(Arc::new(self.guest_memory.clone()), irq_fd);
+        self.net_tapfd = Some(virtio_net.tap_raw_fd());
 
+        self.epoll
+            .add_tap(self.net_tapfd.unwrap())
+            .map_err(Error::EpollError)?;
         let mut io_manager = self.io_manager.lock().unwrap();
 
         io_manager
@@ -197,9 +203,6 @@ impl VMM {
             .unwrap();
 
         // Register the virtio-net device with the epoll context.
-        // self.epoll
-        //     .add_stdin(net.irqfd(), EpollDispatch::Net)
-        //     .map_err(Error::EpollError)?;
 
         // Register the virtio-net device with the VMM.
         // self.vcpus[0].register_device(net);
@@ -342,6 +345,31 @@ impl VMM {
                         .enqueue_raw_bytes(&out[..count])
                         .map_err(Error::StdinWrite)?;
                 }
+
+                if self.net_tapfd == Some(event_data) {
+                    let mut out = [0u8; 2048];
+
+                    let count = self.net_tapfd.read(&mut out).map_err(Error::NetRead)?;
+
+                    self.serial
+                        .lock()
+                        .unwrap()
+                        .serial
+                        .enqueue_raw_bytes(&out[..count])
+                        .map_err(Error::NetWrite)?;
+                }
+                //if let EPOLL_NETFD = event_data {
+                //let mut out = [0u8; 2048];
+
+                //let count = self.netfd.read(&mut out).map_err(Error::NetRead)?;
+
+                //self.serial
+                //.lock()
+                //.unwrap()
+                //.serial
+                //.enqueue_raw_bytes(&out[..count])
+                //.map_err(Error::NetWrite)?;
+                //}
             }
         }
     }
