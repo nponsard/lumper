@@ -8,17 +8,19 @@ extern crate linux_loader;
 extern crate vm_memory;
 extern crate vm_superio;
 
+use std::fs::File;
 use std::io::stdout;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::RawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{io, path::PathBuf};
-use std::fs::File;
 
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VmFd};
 use linux_loader::loader::{self, KernelLoaderResult};
+use memory_allocator::{LumperMemoryAllocator, DEFAULT_ADDRESSS_ALIGNEMNT};
+use vm_allocator::AddressAllocator;
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::terminal::Terminal;
 mod cpu;
@@ -29,6 +31,7 @@ use devices::serial::LumperSerial;
 mod epoll_context;
 use epoll_context::{EpollContext, EPOLL_EVENTS_LEN};
 mod kernel;
+mod memory_allocator;
 
 #[derive(Debug)]
 
@@ -44,6 +47,8 @@ pub enum Error {
     E820Configuration,
     /// Highmem start address is past the guest memory end.
     HimemStartPastMemEnd,
+    /// Memory region start address is past the region end.
+    MemoryRegionStartPastEnd,
     /// I/O error.
     IO(io::Error),
     /// Error issuing an ioctl to KVM.
@@ -66,6 +71,8 @@ pub enum Error {
     TerminalConfigure(kvm_ioctls::Error),
     /// Console configuration error
     ConsoleError(io::Error),
+    /// Memory allocator error
+    MemoryAllocatorError(vm_allocator::Error),
 }
 
 /// Dedicated [`Result`](https://doc.rust-lang.org/std/result/) type.
@@ -79,6 +86,8 @@ pub struct VMM {
 
     serial: Arc<Mutex<LumperSerial>>,
     epoll: EpollContext,
+
+    memory_allocator: AddressAllocator,
 }
 
 impl VMM {
@@ -103,6 +112,9 @@ impl VMM {
                 LumperSerial::new(Box::new(stdout())).map_err(Error::SerialCreation)?,
             )),
             epoll,
+            memory_allocator:
+                <AddressAllocator as LumperMemoryAllocator>::new_64_bit_memory_allocator()
+                    .map_err(Error::MemoryAllocatorError)?,
         };
 
         Ok(vmm)
@@ -112,11 +124,46 @@ impl VMM {
         // Convert memory size from MBytes to bytes.
         let mem_size = ((mem_size_mb as u64) << 20) as usize;
 
+        println!("mem_size: {:?}", mem_size);
+
+        // register reserved memory regions
+        self.memory_allocator
+            .register_x86_reserved_regions()
+            .map_err(Error::MemoryAllocatorError)?;
+
+        println!("memory_allocator: {:?}", self.memory_allocator);
+
+        // get memory regions
+        let mem_regions = self
+            .memory_allocator
+            .allocate_free_slots(
+                mem_size as u64,
+                DEFAULT_ADDRESSS_ALIGNEMNT,
+                vm_allocator::NodeState::Ram,
+            )
+            .map_err(Error::MemoryAllocatorError)?;
+
+        println!("mem_regions: {:?}", mem_regions);
+
         // Create one single memory region, from zero to mem_size.
-        let mem_regions = vec![(GuestAddress(0), mem_size)];
+        let mem_regions = mem_regions
+            .iter()
+            .map(|region| {
+                (
+                    GuestAddress(region.start()),
+                    (region.end() - region.start()) as usize + 1,
+                )
+            })
+            .collect::<Vec<(GuestAddress, usize)>>();
+
+        println!("mem_regions: {:?}", mem_regions);
+
+        // let mem_regions = vec![mem_regions[0]];
 
         // Allocate the guest memory from the memory region.
         let guest_memory = GuestMemoryMmap::from_ranges(&mem_regions).map_err(Error::Memory)?;
+
+        println!("guest_memory: {:?}", guest_memory);
 
         // For each memory region in guest_memory:
         // 1. Create a KVM memory region mapping the memory region guest physical address to the host virtual address.
@@ -135,6 +182,8 @@ impl VMM {
             unsafe { self.vm_fd.set_user_memory_region(kvm_memory_region) }
                 .map_err(Error::KvmIoctl)?;
         }
+
+        println!("guest_memory: {:?}", guest_memory);
 
         self.guest_memory = guest_memory;
 
@@ -164,10 +213,7 @@ impl VMM {
         Ok(())
     }
 
-    pub fn configure_console(
-        &mut self,
-        console_path: Option<String>
-    ) -> Result<()> {
+    pub fn configure_console(&mut self, console_path: Option<String>) -> Result<()> {
         if let Some(console_path) = console_path {
             // We create the file if it does not exist, else we open
             let file = File::create(&console_path).map_err(Error::ConsoleError)?;
@@ -266,10 +312,23 @@ impl VMM {
         }
     }
 
-    pub fn configure(&mut self, num_vcpus: u8, mem_size_mb: u32, kernel_path: &str, console: Option<String>) -> Result<()> {
+    pub fn configure(
+        &mut self,
+        num_vcpus: u8,
+        mem_size_mb: u32,
+        kernel_path: &str,
+        console: Option<String>,
+    ) -> Result<()> {
+        println!("configuring console");
         self.configure_console(console)?;
+        println!("configuring memory");
         self.configure_memory(mem_size_mb)?;
-        let kernel_load = kernel::kernel_setup(&self.guest_memory, PathBuf::from(kernel_path))?;
+        println!("configuring kernel");
+        let kernel_load = kernel::kernel_setup(
+            &self.guest_memory,
+            PathBuf::from(kernel_path),
+            &self.memory_allocator,
+        )?;
         self.configure_io()?;
         self.configure_vcpus(num_vcpus, kernel_load)?;
 
