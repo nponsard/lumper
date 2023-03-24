@@ -32,6 +32,8 @@ use interface::Interface;
 const VIRTIO_HDR_LEN: usize = ::core::mem::size_of::<virtio_net_hdr_v1>();
 // TODO: Make this configurable.
 const VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_VERSION_1)
+    | (1 << 29_u64)
+    | (1 << 35_u64)
     | (1 << VIRTIO_NET_F_CSUM)
     | (1 << VIRTIO_NET_F_GUEST_CSUM)
     | (1 << VIRTIO_NET_F_HOST_TSO4)
@@ -40,6 +42,8 @@ const VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_VERSION_1)
     | (1 << VIRTIO_NET_F_GUEST_TSO4)
     | (1 << VIRTIO_NET_F_GUEST_TSO6)
     | (1 << VIRTIO_NET_F_GUEST_UFO);
+
+const MAX_BUFFER_SIZE: usize = 65565;
 
 #[derive(Debug)]
 
@@ -113,7 +117,7 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioNet<M, I> {
 
     fn write_frame_to_guest(
         &mut self,
-        original_buffer: &mut [u8; 65565],
+        original_buffer: &mut [u8; MAX_BUFFER_SIZE],
         size: usize,
     ) -> Result<bool> {
         let mem = self.address_space.memory();
@@ -158,24 +162,16 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioNet<M, I> {
     }
 
     pub fn process_tap(&mut self) -> Result<()> {
-        let mut something_read = false;
-
         {
-            let buffer = &mut [0u8; 65565];
+            let buffer = &mut [0u8; MAX_BUFFER_SIZE];
 
             loop {
-                let mut read_size = 0;
-                read_size += match self.interface.read(&mut buffer[read_size..]) {
+                let read_size = match self.interface.read(buffer) {
                     Ok(size) => size,
                     Err(_) => {
-                        // TODO: Do something (logs, metrics, etc.) in response to an error when
-                        // reading from tap. EAGAIN means there's nothing available to read anymore
-                        // (because we open the TAP as non-blocking).
                         break;
                     }
                 };
-
-                something_read = true;
 
                 let mem = self.address_space.memory().borrow_mut().clone();
 
@@ -189,22 +185,19 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioNet<M, I> {
             }
         }
 
-        if something_read {
-            if self.device_config.queues[0]
-                .needs_notification(&*self.address_space.memory())
-                .map_err(VirtioNetError::QueueError)?
-            {
-                // TODO: Figure out why we need to do that
-                self.device_config
-                    .interrupt_status
-                    .store(1, Ordering::SeqCst);
+        if self.device_config.queues[0]
+            .needs_notification(&*self.address_space.memory())
+            .map_err(VirtioNetError::QueueError)?
+        {
+            // TODO: Figure out why we need to do that
+            self.device_config
+                .interrupt_status
+                .store(1, Ordering::SeqCst);
 
-                let irq = &mut self.guest_irq_fd;
-                // Error should be recoverable as is, so we just log it.
-                irq.write(1).unwrap_or_else(|e| {
-                    println!("Failed to signal irq: {:?}", e);
-                });
-            }
+            // Error should be recoverable as is, so we just log it.
+            self.guest_irq_fd.write(1).unwrap_or_else(|e| {
+                println!("Failed to signal irq: {:?}", e);
+            });
         }
 
         Ok(())
@@ -224,11 +217,11 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioDeviceType for Vir
 }
 
 impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioMmioDevice for VirtioNet<M, I> {
+    // Please note that this method can be improved error handling wise.
+    // We are limited in how we can handle errors here, as we are not allowed to return a Result.
     fn queue_notify(&mut self, val: u32) {
         if val == 0 {
-            return self.process_tap().unwrap_or_else(|e| {
-                println!("Error processing tap: {:?}", e);
-            });
+            return;
         }
 
         let mem = self.address_space.memory().clone();
@@ -236,31 +229,56 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioMmioDevice for Vir
         let queue = &mut self.device_config.queues[1];
 
         loop {
-            queue.disable_notification(&*mem).unwrap();
-
-            // Consume entries from the available ring.
-            while let Some(chain) = queue.iter(&*mem).unwrap().next() {
-                chain.clone().for_each(|desc| {
-                    if (desc.len() as usize) < VIRTIO_HDR_LEN {
-                        println!("invalid virtio header length");
-                        return;
-                    }
-
-                    let mut data_buffer: Vec<u8> = Vec::new();
-
-                    data_buffer.resize(desc.len() as usize, 0u8);
-                    mem.read_slice(&mut data_buffer, desc.addr()).unwrap();
-                    self.interface.write(&data_buffer).unwrap();
-                });
-
-                queue.add_used(&*mem, chain.head_index(), 0x100).unwrap();
-
-                if queue.needs_notification(&*mem).unwrap() {
-                    irq.write(1).unwrap();
+            match queue.disable_notification(&*mem) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Failed to disable notification: {:?}", e);
+                    break;
                 }
             }
 
-            if !queue.enable_notification(&*mem).unwrap() {
+            // Consume entries from the available ring.
+            // Never fails since we know the memory is valid.
+            while let Some(chain) = queue.iter(&*mem).unwrap().next() {
+                let mut data_buffer: Vec<u8> = Vec::new();
+                chain.clone().for_each(|desc| {
+                    let initial_buffer_len = data_buffer.len();
+
+                    data_buffer.resize(data_buffer.len() + desc.len() as usize, 0);
+
+                    // Safe as we just allocated the buffer and mem is valid.
+                    // If it actually fails, it is probably unrecoverable anyway.
+                    mem.read_slice(&mut data_buffer[initial_buffer_len..], desc.addr())
+                        .unwrap();
+                });
+
+                if (data_buffer.len() as usize) < VIRTIO_HDR_LEN {
+                    println!("invalid net packet");
+                    return;
+                }
+
+                match self.interface.write(&data_buffer) {
+                    Ok(_) => {
+                        queue
+                            .add_used(&*mem, chain.head_index(), 0x100)
+                            // Try continuing even if we failed to add the used buffer.
+                            .unwrap_or_else(|e| {
+                                println!("Failed to add used buffer: {:?}", e);
+                            });
+
+                        if queue.needs_notification(&*mem).unwrap_or_default() {
+                            irq.write(1).unwrap_or_else(|e| {
+                                println!("Failed to signal irq: {:?}", e);
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to write to tap: {:?}", e);
+                    }
+                }
+            }
+
+            if !queue.enable_notification(&*mem).unwrap_or_default() {
                 break;
             }
         }
@@ -287,9 +305,7 @@ impl<M: GuestAddressSpace + Clone + Send, I: Interface> VirtioDeviceActions for 
     type E = VirtioNetError;
 
     fn activate(&mut self) -> Result<()> {
-        self.interface
-            .activate(VIRTIO_FEATURES, VIRTIO_HDR_LEN)
-            .unwrap();
+        self.interface.activate(VIRTIO_FEATURES, VIRTIO_HDR_LEN)?;
 
         Ok(())
     }

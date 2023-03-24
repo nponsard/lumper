@@ -177,6 +177,7 @@ impl VMM {
             None => return Ok(()),
         };
 
+        // Temporary hardcoded address, see allocator PR
         let virtio_address = GuestAddress(0xd0000000);
 
         let irq_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::IrqRegister)?;
